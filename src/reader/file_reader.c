@@ -293,6 +293,28 @@ void carquet_reader_options_init(carquet_reader_options_t* options) {
  */
 #define CARQUET_FOOTER_SPECULATIVE_SIZE (64 * 1024)
 
+/* parquet-mr 1.8 and older omit dictionary_page_offset; the dictionary page then sits at data_page_offset */
+static void fix_legacy_dictionary_offsets(parquet_file_metadata_t* md) {
+    for (int32_t g = 0; g < md->num_row_groups; g++) {
+        parquet_row_group_t* rg = &md->row_groups[g];
+        for (int32_t c = 0; c < rg->num_columns; c++) {
+            parquet_column_metadata_t* meta = &rg->columns[c].metadata;
+            if (!rg->columns[c].has_metadata ||
+                (meta->has_dictionary_page_offset && meta->dictionary_page_offset > 0)) {
+                continue;
+            }
+            for (int32_t e = 0; e < meta->num_encodings; e++) {
+                if (meta->encodings[e] == CARQUET_ENCODING_PLAIN_DICTIONARY ||
+                    meta->encodings[e] == CARQUET_ENCODING_RLE_DICTIONARY) {
+                    meta->has_dictionary_page_offset = true;
+                    meta->dictionary_page_offset = meta->data_page_offset;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* error) {
     /* Seek to end to get file size (64-bit aware for files >2 GiB on Windows) */
     if (carquet_fseek64(reader->file, 0, SEEK_END) != 0) {
@@ -399,6 +421,7 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
     if (status != CARQUET_OK) {
         return status;
     }
+    fix_legacy_dictionary_offsets(&reader->metadata);
 
     /* Build schema */
     reader->schema = build_schema(&reader->arena, &reader->metadata, error);
@@ -449,6 +472,7 @@ static carquet_status_t read_footer_mmap(carquet_reader_t* reader, carquet_error
     if (status != CARQUET_OK) {
         return status;
     }
+    fix_legacy_dictionary_offsets(&reader->metadata);
 
     /* Build schema */
     reader->schema = build_schema(&reader->arena, &reader->metadata, error);
