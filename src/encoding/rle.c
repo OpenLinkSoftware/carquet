@@ -101,8 +101,23 @@ static bool fill_bitpack_buffer(carquet_rle_decoder_t* dec) {
     /* Read 8 packed values */
     size_t bytes_needed = (size_t)dec->bit_width;  /* 8 values * bit_width bits = bit_width bytes */
     if (dec->pos + bytes_needed > dec->size) {
-        dec->status = CARQUET_ERROR_INVALID_RLE;
-        return false;
+        /* Impala truncates the last group to the bytes its real values need */
+        size_t avail = dec->size - dec->pos;
+        int64_t n = dec->bit_width ? (int64_t)(avail * 8 / (size_t)dec->bit_width) : 0;
+        uint8_t padded[32] = {0};
+        if (n <= 0) {
+            dec->status = CARQUET_ERROR_INVALID_RLE;
+            return false;
+        }
+        memcpy(padded, dec->data + dec->pos, avail);
+        carquet_bitunpack8_32(padded, dec->bit_width, dec->bitpack_buffer);
+        dec->pos = dec->size;
+        dec->bitpack_pos = 0;
+        dec->bitpack_count = (int)n;
+        if (dec->run_remaining > n) {
+            dec->run_remaining = n;
+        }
+        return true;
     }
 
     carquet_bitunpack8_32(dec->data + dec->pos, dec->bit_width, dec->bitpack_buffer);
