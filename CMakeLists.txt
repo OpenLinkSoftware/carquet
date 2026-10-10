@@ -39,6 +39,9 @@ option(CARQUET_BUILD_ARROW_CPP_BENCHMARK "Build the optional Arrow C++ compariso
 option(CARQUET_BUILD_INTEROP "Build interoperability test programs" ${CARQUET_BUILD_DEV})
 option(CARQUET_BUILD_CLI "Build carquet CLI tool" ON)
 option(CARQUET_BUILD_SHARED "Build shared library" OFF)
+option(CARQUET_BUNDLE_STATIC_DEPS
+    "Merge static dependency archives into libcarquet.a; useful when linking libcarquet.a into another shared library"
+    OFF)
 option(CARQUET_ENABLE_SSE "Enable SSE optimizations" ON)
 option(CARQUET_ENABLE_AVX "Enable AVX optimizations" ON)
 option(CARQUET_ENABLE_AVX2 "Enable AVX2 optimizations" ON)
@@ -194,6 +197,7 @@ if(CARQUET_LZ4_TARGET)
     set(LZ4_INCLUDE_DIRS "")
     set(LZ4_FOUND TRUE)
 elseif(NOT CARQUET_BUNDLE_DEPS)
+    set(LZ4_FOUND FALSE)
     find_package(lz4 CONFIG QUIET)
 else()
     set(lz4_FOUND FALSE)  # see ZSTD_FOUND above
@@ -230,9 +234,21 @@ if(NOT LZ4_FOUND AND NOT CARQUET_BUNDLE_DEPS)
         pkg_check_modules(LZ4 QUIET liblz4)
         if(LZ4_FOUND)
             message(STATUS "Found system liblz4 via pkg-config")
-            # Use LINK_LIBRARIES (full paths) instead of LIBRARIES (bare names)
-            # to avoid MSVC linker failing to locate the .lib file
-            if(LZ4_LINK_LIBRARIES)
+            if(CARQUET_BUNDLE_STATIC_DEPS)
+                find_library(LZ4_STATIC_LIBRARY
+                    NAMES liblz4.a lz4
+                    PATHS ${LZ4_LIBRARY_DIRS}
+                    NO_DEFAULT_PATH)
+                if(LZ4_STATIC_LIBRARY)
+                    set(LZ4_LIBRARIES "${LZ4_STATIC_LIBRARY}")
+                else()
+                    message(FATAL_ERROR
+                        "CARQUET_BUNDLE_STATIC_DEPS requires a static lz4 archive, "
+                        "but pkg-config did not lead to liblz4.a")
+                endif()
+            elseif(LZ4_LINK_LIBRARIES)
+                # Use LINK_LIBRARIES (full paths) instead of LIBRARIES (bare names)
+                # to avoid MSVC linker failing to locate the .lib file
                 set(LZ4_LIBRARIES ${LZ4_LINK_LIBRARIES})
             endif()
         endif()
@@ -627,6 +643,78 @@ endif()
 # Link OpenMP for parallel column reading
 if(OpenMP_C_FOUND)
     target_link_libraries(carquet PRIVATE OpenMP::OpenMP_C)
+endif()
+
+if(CARQUET_BUNDLE_STATIC_DEPS)
+    if(CARQUET_BUILD_SHARED)
+        message(FATAL_ERROR "CARQUET_BUNDLE_STATIC_DEPS is only valid for static libcarquet.a builds")
+    endif()
+    if(NOT UNIX)
+        message(FATAL_ERROR "CARQUET_BUNDLE_STATIC_DEPS currently supports Unix ar archives only")
+    endif()
+
+    function(carquet_append_bundle_archive out_var lib)
+        set(_result "${${out_var}}")
+        if(TARGET ${lib})
+            get_target_property(_type ${lib} TYPE)
+            if(_type STREQUAL "INTERFACE_LIBRARY")
+                get_target_property(_interface_libs ${lib} INTERFACE_LINK_LIBRARIES)
+                if(_interface_libs)
+                    foreach(_interface_lib IN LISTS _interface_libs)
+                        carquet_append_bundle_archive(_result "${_interface_lib}")
+                    endforeach()
+                endif()
+            else()
+                list(APPEND _result "$<TARGET_FILE:${lib}>")
+            endif()
+        elseif(IS_ABSOLUTE "${lib}")
+            list(APPEND _result "${lib}")
+        elseif("${lib}" MATCHES "^-")
+            message(STATUS "Skipping linker flag while bundling static deps: ${lib}")
+        elseif("${lib}" MATCHES "\\.(a|lib)$")
+            list(APPEND _result "${lib}")
+        elseif("${lib}" MATCHES "\\.(dylib|so|tbd)$")
+            message(FATAL_ERROR
+                "CARQUET_BUNDLE_STATIC_DEPS can only merge static archives, but ${lib} is not static")
+        else()
+            message(WARNING
+                "Skipping non-archive dependency while bundling static deps: ${lib}. "
+                "Use a full path to a static archive if this dependency must be bundled.")
+        endif()
+        set(${out_var} "${_result}" PARENT_SCOPE)
+    endfunction()
+
+    set(CARQUET_BUNDLED_DEP_ARCHIVES)
+    foreach(_lib IN LISTS CARQUET_COMPRESSION_LIBS)
+        carquet_append_bundle_archive(CARQUET_BUNDLED_DEP_ARCHIVES "${_lib}")
+    endforeach()
+    if(ZLIB_FOUND)
+        carquet_append_bundle_archive(CARQUET_BUNDLED_DEP_ARCHIVES ZLIB::ZLIB)
+    else()
+        foreach(_lib IN LISTS ZLIB_LIBRARIES)
+            carquet_append_bundle_archive(CARQUET_BUNDLED_DEP_ARCHIVES "${_lib}")
+        endforeach()
+    endif()
+    if(OpenMP_C_FOUND)
+        carquet_append_bundle_archive(CARQUET_BUNDLED_DEP_ARCHIVES OpenMP::OpenMP_C)
+    endif()
+
+    if(CARQUET_BUNDLED_DEP_ARCHIVES)
+        add_custom_command(TARGET carquet POST_BUILD
+            COMMAND "${CMAKE_COMMAND}"
+                "-DOUTPUT=$<TARGET_FILE:carquet>"
+                "-DINPUTS=$<TARGET_FILE:carquet>;${CARQUET_BUNDLED_DEP_ARCHIVES}"
+                "-DCMAKE_AR=${CMAKE_AR}"
+                "-DCMAKE_RANLIB=${CMAKE_RANLIB}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/merge_archives.cmake"
+            VERBATIM
+            COMMENT "Merging static dependency archives into libcarquet.a")
+    endif()
+
+    # The dependency objects are physically present in libcarquet.a after the
+    # post-build merge, so installed CMake consumers should not be forced to
+    # name the original dependency archives again.
+    set_target_properties(carquet PROPERTIES INTERFACE_LINK_LIBRARIES "")
 endif()
 
 # Architecture definitions
